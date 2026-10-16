@@ -1,0 +1,16 @@
+# FUTURE TLS PATH (not active yet). Today ports 80/443 on this VPS are owned by
+# Dokploy's Traefik (0.0.0.0:80 + 0.0.0.0:443), so Caddy cannot bind them and the
+# relay runs as plain HTTP on :8787 (firewalled open via iptables for that port).
+#
+# To go TLS: delegate a subdomain (e.g. relay.indtools.in) to 140.245.23.32,
+# then EITHER
+#   (a) add a Traefik route in Dokploy for the relay container (preferred, no
+#       extra daemon), OR
+#   (b) stop Traefik binding 443 and run Caddy with this file:
+#
+# relay.indtools.in {
+#     reverse_proxy 127.0.0.1:8787
+# }
+#
+# Then point the Frappe app at https://relay.indtools.in and delete the
+# port from URLs. Until then, production traffic to :8787 is unencrypted.

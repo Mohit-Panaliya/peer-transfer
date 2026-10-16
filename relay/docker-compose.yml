@@ -1,0 +1,18 @@
+services:
+  peer-relay:
+    build: .
+    image: peer-relay:0.1.0
+    container_name: peer-relay
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    volumes:
+      - relay-data:/data
+    environment:
+      RELAY_PORT: "8787"
+      RELAY_DB: /data/relay.db
+      RELAY_DEFAULT_TTL: "3600"
+      RELAY_MAX_TTL: "86400"
+
+volumes:
+  relay-data:
