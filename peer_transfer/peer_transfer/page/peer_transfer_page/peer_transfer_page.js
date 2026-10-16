@@ -84,6 +84,13 @@ peer_transfer.PeerTransferPage = class PeerTransferPage {
 				.pt-log-row { cursor: pointer; }
 				.pt-log-row:hover td { background: var(--gray-50); }
 				.pt-pager { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+				.pt-banner { border-radius: 6px; padding: 9px 12px; margin-top: 8px; font-size: 12.5px; line-height: 1.5; }
+				.pt-banner-red { background: var(--red-50); border: 1px solid var(--red-300); color: var(--red-700); }
+				.pt-banner-amber { background: #fff8e6; border: 1px solid #e8c547; color: #7a5b00; }
+				.pt-banner-green { background: var(--green-50); border: 1px solid var(--green-300); color: var(--green-700); }
+				.pt-banner-title { font-weight: 700; display: block; margin-bottom: 4px; }
+				.pt-warn-details { margin-top: 8px; }
+				.pt-warn-details summary { cursor: pointer; font-weight: 600; }
 			</style>
 		`);
 	}
@@ -451,8 +458,18 @@ peer_transfer.PeerTransferPage = class PeerTransferPage {
 				}
 				this.conn = r.message;
 				this.render_schema();
-				this.pv = { key: code, offset: 0, limit: 50, total: 0, rows: [] };
-				this.load_preview();
+				if (this.schema_allows_accept(this.conn && this.conn.schema_diff)) {
+					this.pv = { key: code, offset: 0, limit: 50, total: 0, rows: [] };
+					this.load_preview();
+				} else {
+					// Blocked: hide preview, show decision card with Accept disabled.
+					this.$("#pt-preview-card").hide();
+					this.$("#pt-preview-body").html("");
+					this.$("#pt-decision-card").show();
+					this.$("#pt-receipt").html("");
+					this.$("#pt-decision-status").html("");
+					this.update_accept_state();
+				}
 			},
 			error: (err) => {
 				this.busy = false;
@@ -462,33 +479,96 @@ peer_transfer.PeerTransferPage = class PeerTransferPage {
 		});
 	}
 
+	// Normalize schema_diff across server versions.
+	// New: {match, blocking:[], warnings:[], diffs:[], app_gaps:[]}.
+	// Legacy: only {match, diffs} — treat legacy diffs as blocking.
+	normalized_schema_diff(diff) {
+		const d = diff || {};
+		const has_new_keys =
+			Object.prototype.hasOwnProperty.call(d, "blocking") ||
+			Object.prototype.hasOwnProperty.call(d, "warnings") ||
+			Object.prototype.hasOwnProperty.call(d, "app_gaps");
+		const app_gaps = Array.isArray(d.app_gaps) ? d.app_gaps : [];
+		let blocking = Array.isArray(d.blocking) ? d.blocking : [];
+		let warnings = Array.isArray(d.warnings) ? d.warnings : [];
+		const diffs = Array.isArray(d.diffs) ? d.diffs : [];
+		if (!has_new_keys && diffs.length && !d.match) {
+			blocking = diffs;
+		}
+		return {
+			match: !!d.match,
+			blocking: blocking,
+			warnings: warnings,
+			app_gaps: app_gaps,
+			diffs: diffs,
+		};
+	}
+
+	// Single gating authority: Accept is allowed only with zero
+	// blocking entries and zero app gaps. Warnings never block.
+	schema_allows_accept(diff) {
+		const n = this.normalized_schema_diff(diff);
+		return n.blocking.length === 0 && n.app_gaps.length === 0;
+	}
+
+	update_accept_state() {
+		const allowed = this.schema_allows_accept(this.conn && this.conn.schema_diff);
+		this.$("#pt-accept").prop("disabled", !allowed);
+		return allowed;
+	}
+
+	schema_issue_table(rows) {
+		if (!rows.length) return "";
+		if (typeof rows[0] === "string") {
+			return `<table class="table table-sm pt-table"><thead><tr><th>${__("Difference")}</th></tr></thead><tbody>` +
+				rows.map((d) => `<tr class="pt-diff-row"><td>${this.esc(d)}</td></tr>`).join("") +
+				`</tbody></table>`;
+		}
+		const cols = ["doctype", "field", "issue", "detail"];
+		return `<table class="table table-sm pt-table"><thead><tr>` +
+			cols.map((k) => `<th>${this.esc(k)}</th>`).join("") + `</tr></thead><tbody>` +
+			rows.map((d) => `<tr class="pt-diff-row">` +
+				cols.map((k) => `<td>${this.esc(d && d[k] != null ? d[k] : "")}</td>`).join("") +
+				`</tr>`).join("") +
+			`</tbody></table>`;
+	}
+
 	render_schema() {
 		const c = this.conn;
-		const diff = (c && c.schema_diff) || {};
-		const diffs = diff.diffs || [];
-		const match = !!diff.match;
+		const n = this.normalized_schema_diff(c && c.schema_diff);
+		const gaps = n.app_gaps;
+		const blocking = n.blocking;
+		const warnings = n.warnings;
 		let html = `<div class="pt-card"><div class="pt-card-head"><i class="fa fa-check-square-o"></i>
-			${__("Schema")} ${this.esc(c.name || "")}</div><div class="pt-card-body">`;
-		if (match) {
-			html += `<span class="pt-pill pt-pill-green">${__("SCHEMA MATCH")}</span>`;
+			${__("Schema")} ${this.esc((c && c.name) || "")}</div><div class="pt-card-body">`;
+		if (gaps.length) {
+			const items = gaps.map((g) => {
+				if (typeof g === "string") return `<li>${this.esc(g)}</li>`;
+				const app = (g && (g.app || g.app_name)) || "";
+				const ver = (g && (g.sender_version || g.version)) || "";
+				const detail = (g && g.detail) || "";
+				let line = `${__("Receiver is missing apps")}: ${this.esc(app)}` +
+					(ver ? ` (${__("sender")} v${this.esc(ver)})` : "") +
+					` — ${__("install on this site (bench get-app … + install-app + migrate), then reconnect.")}`;
+				if (detail) line += ` <span class="text-muted">${this.esc(detail)}</span>`;
+				return `<li>${line}</li>`;
+			}).join("");
+			html += `<div class="pt-banner pt-banner-red" id="pt-app-gaps"><span class="pt-banner-title">${__("Missing apps — cannot import")}</span><ul style="margin: 0; padding-left: 18px;">${items}</ul></div>`;
+		} else if (blocking.length) {
+			html += `<div class="pt-banner pt-banner-red" id="pt-blocked-banner"><span class="pt-banner-title">${__("BLOCKED — schema differences that would lose data")}</span>` +
+				this.schema_issue_table(blocking) + `</div>`;
+		} else if (warnings.length) {
+			html += `<div class="pt-banner pt-banner-amber" id="pt-warnings-banner"><span class="pt-banner-title">${__("Non-blocking differences")} (${warnings.length}) — ${__("safe to proceed, these fields are UI-only or compatible")}</span>` +
+				`<details class="pt-warn-details"><summary>${__("Show differences")} (${warnings.length})</summary>` +
+				this.schema_issue_table(warnings) + `</details></div>`;
+		} else if (n.match) {
+			html += `<span class="pt-pill pt-pill-green" id="pt-match-pill">${__("SCHEMA MATCH")}</span>`;
 		} else {
+			// Fallback: no match flag and no categorized rows (e.g. empty legacy diff).
 			html += `<span class="pt-pill pt-pill-red">${__("SCHEMA DIFF")}</span>`;
-			if (!diffs.length) {
-				html += `<div class="text-muted" style="margin-top:6px;">${__("Schemas differ (no detail returned).")}</div>`;
-			} else if (typeof diffs[0] === "string") {
-				html += `<table class="table table-sm pt-table"><thead><tr><th>${__("Difference")}</th></tr></thead><tbody>` +
-					diffs.map((d) => `<tr class="pt-diff-row"><td>${this.esc(d)}</td></tr>`).join("") +
-					`</tbody></table>`;
-			} else {
-				const cols = [...new Set(diffs.flatMap((d) => Object.keys(d || {})))];
-				html += `<table class="table table-sm pt-table"><thead><tr>` +
-					cols.map((k) => `<th>${this.esc(k)}</th>`).join("") + `</tr></thead><tbody>` +
-					diffs.map((d) => `<tr class="pt-diff-row">` +
-						cols.map((k) => `<td>${this.esc(d[k])}</td>`).join("") + `</tr>`).join("") +
-					`</tbody></table>`;
-			}
+			html += `<div class="text-muted" style="margin-top:6px;">${__("Schemas differ (no detail returned).")}</div>`;
 		}
-		if (c.manifest) {
+		if (c && c.manifest) {
 			html += `<div class="text-muted" style="margin-top: 8px; word-break: break-all;">
 				<strong>${__("Manifest")}:</strong> ${this.esc(
 					typeof c.manifest === "string" ? c.manifest : JSON.stringify(c.manifest)
@@ -496,6 +576,15 @@ peer_transfer.PeerTransferPage = class PeerTransferPage {
 		}
 		html += `</div></div>`;
 		this.$("#pt-schema-panel").html(html);
+		if (!this.schema_allows_accept(c && c.schema_diff)) {
+			// Keep a stale preview from a previous connect from showing.
+			this.$("#pt-preview-card").hide();
+		} else {
+			// Allowed (match or warnings-only): preview will be (re)filled
+			// by load_preview; unhide in case a previous blocked connect hid it.
+			this.$("#pt-preview-card").show();
+		}
+		this.update_accept_state();
 	}
 
 	load_preview() {
@@ -639,6 +728,7 @@ peer_transfer.PeerTransferPage = class PeerTransferPage {
 		</div>`;
 
 		this.$("#pt-preview-body").html(html);
+		this.update_accept_state();
 		this.$("#pt-prev").on("click", () => {
 			this.pv.offset = Math.max(0, this.pv.offset - this.pv.limit);
 			this.load_preview();
@@ -656,6 +746,10 @@ peer_transfer.PeerTransferPage = class PeerTransferPage {
 
 	accept() {
 		if (this.busy || !this.pv.key) return;
+		if (!this.schema_allows_accept(this.conn && this.conn.schema_diff)) {
+			frappe.show_alert({ message: __("Schema check blocks import. Resolve the differences first."), indicator: "red" });
+			return;
+		}
 		frappe.confirm(
 			__("This will import the transfer into the current site. Continue?"),
 			() => {

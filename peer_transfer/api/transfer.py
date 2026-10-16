@@ -136,6 +136,133 @@ def _manifest_of(payload):
 	return payload if isinstance(payload, dict) else {}
 
 
+def _local_app_names():
+	"""Installed app names on this site, guarded (never throws)."""
+	try:
+		return list(frappe.get_installed_apps() or [])
+	except Exception:
+		return []
+
+
+def get_app_gaps(manifest):
+	"""Sender apps missing locally (compared by app name; version drift ignored).
+
+	Returns [{app, sender_version, detail}] with detail
+	"Install app 'X' (sender has vY) on this site, then reconnect.".
+	Old manifests without sender_apps yield [] (no crash, no gap).
+	"""
+	manifest = manifest or {}
+	try:
+		sender_apps = manifest.get("sender_apps") or []
+	except Exception:
+		sender_apps = []
+	if not isinstance(sender_apps, list):
+		return []
+	try:
+		local = set(_local_app_names())
+	except Exception:
+		local = set()
+	gaps = []
+	for entry in sender_apps:
+		if not isinstance(entry, dict):
+			continue
+		app = entry.get("app")
+		if not app or app in local:
+			continue
+		ver = entry.get("sender_version", entry.get("version", ""))
+		try:
+			ver = "" if ver is None else str(ver)
+		except Exception:
+			ver = ""
+		gaps.append(
+			{
+				"app": app,
+				"sender_version": ver,
+				"detail": "Install app '{0}' (sender has v{1}) on this site, then reconnect.".format(app, ver),
+			}
+		)
+	return gaps
+
+
+def _is_nonempty_row_value(value):
+	"""A row carries data for a warned field only when the value is non-empty."""
+	if value is None:
+		return False
+	if isinstance(value, bool):
+		return value
+	if isinstance(value, str):
+		return bool(value.strip())
+	if isinstance(value, (list, tuple, dict, set)):
+		return len(value) > 0
+	if isinstance(value, (int, float)):
+		return value != 0
+	return True
+
+
+def escalate_warnings_with_values(warnings, rows, sender_snapshot=None):
+	"""Row-value escalation pass over compare() warnings.
+
+	For every warning with issue "missing_field" (field absent locally),
+	scan the offer rows for a non-empty value in that field. Layout-type
+	warnings never escalate (no row data to lose). Non-missing warnings
+	(type_mismatch within TEXT_GROUP, options_mismatch, mandatory_mismatch)
+	never escalate (field exists locally, values still storable).
+
+	Returns a list of BLOCKING diff entries
+	{doctype, field, issue, detail, severity} -- empty when nothing carries
+	values. Callers throw when the result is non-empty.
+	"""
+	escalated = []
+	sender_snapshot = sender_snapshot if isinstance(sender_snapshot, dict) else {}
+	for w in warnings or []:
+		if not isinstance(w, dict):
+			continue
+		if w.get("issue") != "missing_field":
+			continue
+		doctype, field = w.get("doctype"), w.get("field")
+		if not doctype or not field:
+			continue
+		try:
+			s_ft = ((sender_snapshot.get(doctype) or {}).get(field) or {}).get("fieldtype") or ""
+		except Exception:
+			s_ft = ""
+		try:
+			if s_ft and s_ft in _schema.LAYOUT_TYPES:
+				continue
+		except Exception:
+			pass
+		count, sample = 0, None
+		for r in rows or []:
+			if not isinstance(r, dict):
+				continue
+			if r.get("doctype") != doctype:
+				continue
+			data = r.get("data")
+			if not isinstance(data, dict):
+				continue
+			if _is_nonempty_row_value(data.get(field)):
+				count += 1
+				if sample is None:
+					sample = data.get(field)
+		if count:
+			try:
+				sample_txt = str(sample)[:80]
+			except Exception:
+				sample_txt = "?"
+			escalated.append(
+				{
+					"doctype": doctype,
+					"field": field,
+					"issue": "data_at_risk",
+					"detail": "Field '{0}.{1}' does not exist locally but {2} row(s) carry values (e.g. '{3}'); data would be silently dropped".format(
+						doctype, field, count, sample_txt
+					),
+					"severity": "blocking",
+				}
+			)
+	return escalated
+
+
 def _rows_of(payload):
 	"""Flatten relay rows responses into doc rows.
 
@@ -290,7 +417,10 @@ def create_offer(root_doctype="Customer", root_names=None, ttl_secs=3600):
 def connect_with_code(code):
 	"""Pair with a relay offer code.
 
-	Returns {name, manifest, schema_diff: {match, diffs}}.
+	Returns {name, manifest, schema_diff: {match, blocking, warnings, diffs, app_gaps}}.
+	``match`` is True when there is no blocking schema diff (warnings alone
+	still match); ``app_gaps`` lists sender apps missing locally (blocking
+	at accept time).
 	"""
 	_require_role()
 	if not code:
@@ -305,6 +435,10 @@ def connect_with_code(code):
 	sender_snapshot = manifest.get("schema_snapshot") or {}
 	local_snapshot = _schema.snapshot(list(sender_snapshot.keys()) or None)
 	diff = _schema.compare(sender_snapshot, local_snapshot)
+	try:
+		diff["app_gaps"] = get_app_gaps(manifest)
+	except Exception:
+		diff["app_gaps"] = []
 
 	name = _store_transfer("Received", ST_PREVIEWED, code, manifest, manifest.get("roots"), "previewed")
 	return {"name": name, "manifest": manifest, "schema_diff": diff}
@@ -443,21 +577,39 @@ def accept_and_import(code_or_name):
 	ok, hash_err = _schema.verify_manifest(manifest)
 	if not ok:
 		frappe.throw(_("Schema verification failed: {0}").format(hash_err))
-	diff = _schema.compare(manifest.get("schema_snapshot") or {})
-	if not diff.get("match"):
-		first = (diff.get("diffs") or [{}])[0]
+	sender_snapshot = manifest.get("schema_snapshot") or {}
+	diff = _schema.compare(sender_snapshot)
+	blocking = diff.get("blocking") or []
+	if blocking:
+		first = (blocking or [{}])[0]
 		frappe.throw(
-			_("Schema mismatch: {0} ({1} diff(s), first: {2}.{3} {4})").format(
+			_("Schema mismatch: {0} ({1} blocking diff(s), first: {2}.{3} {4})").format(
 				"offer schema does not match local meta",
-				len(diff.get("diffs") or []),
+				len(blocking),
 				first.get("doctype"),
 				first.get("field"),
 				first.get("issue"),
 			)
 		)
+	gaps = get_app_gaps(manifest)
+	if gaps:
+		names = ", ".join("{0} (sender has v{1})".format(g.get("app"), g.get("sender_version")) for g in gaps)
+		frappe.throw(
+			_("Missing apps on this site: {0}. {1}").format(
+				names, (gaps[0] or {}).get("detail") or "Install the missing app(s), then reconnect."
+			)
+		)
 
-	# 2. Fetch all rows + dry-run link resolution.
+	# 2. Fetch all rows + row-value escalation pass over warnings.
 	rows, _total = _fetch_all_rows(code)
+	escalated = escalate_warnings_with_values(diff.get("warnings") or [], rows, sender_snapshot)
+	if escalated:
+		first = (escalated or [{}])[0]
+		frappe.throw(
+			_("Schema data at risk: {0} ({1} escalated field(s), first: {2}.{3})").format(
+				first.get("detail"), len(escalated), first.get("doctype"), first.get("field")
+			)
+		)
 	rows = sorted(rows, key=lambda r: (_import_order_index((r or {}).get("doctype")), (r or {}).get("name") or ""))
 	pre = _dry_run(rows)
 

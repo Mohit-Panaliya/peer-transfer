@@ -10,10 +10,12 @@ for Customer, Address, Contact, Customer Group, Territory, Price List
 ``schema_hash`` is sha256 over the canonical JSON of the snapshot.
 ``compare`` diffs a sender snapshot against local meta::
 
-    diffs: [{doctype, field, issue, detail}]
-    issue in missing_field | type_mismatch | mandatory_mismatch
+    blocking / warnings / diffs: [{doctype, field, issue, detail, severity}]
+    issue in missing_field | type_mismatch | mandatory_mismatch | options_mismatch
 
-``match`` is True only when there are no diffs. Import is gated on match
+``match`` is True only when there are no BLOCKING diffs (warnings alone do
+not block import; they may still escalate at accept time if rows carry
+values for a warned-away field). Import is gated on match + no app gaps
 (strict -- no hash-equality fallback).
 """
 
@@ -32,6 +34,44 @@ CLOSURE_DOCTYPES = [
 	"Contact",
 	"Dynamic Link",
 ]
+
+# UI-only fieldtypes that carry no storable row data.
+# Verified against frappe/model/__init__.py `display_fieldtypes`:
+#   ("Section Break", "Column Break", "Tab Break", "HTML",
+#    "Button", "Image", "Fold", "Heading").
+# NOTE: "Image" here is the display fieldtype (no_value_fields). It is NOT
+# "Attach Image" (which IS data-carrying -- in data_fieldtypes -- and is
+# deliberately excluded from this set). When in doubt a type stays OUT.
+LAYOUT_TYPES = frozenset(
+	{
+		"Section Break",
+		"Column Break",
+		"Tab Break",
+		"HTML",
+		"Button",
+		"Fold",
+		"Heading",
+		"Image",
+	}
+)
+
+# Compatible free-text types: values remain storable across these types,
+# so a mismatch within the group is a warning, not blocking.
+# (All are in frappe's data_fieldtypes.)
+TEXT_GROUP = frozenset(
+	{
+		"Data",
+		"Small Text",
+		"Text",
+		"Text Editor",
+		"Code",
+		"Read Only",
+		"Autocomplete",
+	}
+)
+
+# Child-table carriers: a missing table locally always risks data loss.
+TABLE_TYPES = frozenset({"Table", "Table MultiSelect"})
 
 
 def canonical(obj):
@@ -78,66 +118,185 @@ def snapshot(doctypes=None):
 	return {dt: snapshot_doctype(dt) for dt in doctypes}
 
 
+def _norm_options(options):
+	"""Normalize a Select options string into a comparable list of lines."""
+	if options is None:
+		return []
+	try:
+		text = str(options)
+	except Exception:
+		return []
+	# Frappe Select options are newline-separated; compare line-by-line
+	# after stripping whitespace, dropping empties.
+	return [line.strip() for line in text.replace("\r\n", "\n").split("\n") if line.strip()]
+
+
 def compare(sender_snapshot, local_snapshot=None):
 	"""Diff a sender snapshot against local meta.
 
-	Returns {"match": bool, "diffs": [{doctype, field, issue, detail}]}.
-	Extra local fields are ignored (sender-subset comparison only).
+	Returns {"match": bool, "blocking": [...], "warnings": [...], "diffs": [...]}.
+	Every diff entry is {doctype, field, issue, detail, severity} with
+	severity in "blocking" | "warning". ``diffs`` = blocking + warnings
+	(kept for backward compatibility) and ``match`` is True when there is
+	no blocking entry (warnings do NOT block import by themselves).
+
+	Severity rules (general-purpose, sender-subset comparison; extra local
+	fields are ignored):
+	  * missing locally + fieldtype in LAYOUT_TYPES -> warning
+	  * missing Table / Table MultiSelect -> blocking
+	  * missing data field + sender reqd=1 -> blocking
+	  * missing + optional -> warning
+	  * type mismatch within TEXT_GROUP -> warning; cross-group -> blocking
+	  * Select options differing (same fieldtype, different options) -> warning
+
+	``local_snapshot`` keeps its old meaning: a {doctype: {field: spec}}
+	snapshot dict, or None to snapshot live local meta. A non-dict value
+	is treated as None (live snapshot) so older callers cannot crash here.
 	"""
 	sender_snapshot = sender_snapshot or {}
-	if local_snapshot is None:
+	if local_snapshot is None or not isinstance(local_snapshot, dict):
 		doctypes = list(sender_snapshot.keys()) or list(CLOSURE_DOCTYPES)
 		local_snapshot = snapshot(doctypes)
-	diffs = []
+	blocking = []
+	warnings = []
 	for doctype, sender_fields in (sender_snapshot or {}).items():
 		sender_fields = sender_fields or {}
 		local_fields = (local_snapshot or {}).get(doctype) or {}
 		if not local_fields and not frappe.db.exists("DocType", doctype):
-			diffs.append(
+			blocking.append(
 				{
 					"doctype": doctype,
 					"field": "",
 					"issue": "missing_field",
 					"detail": "DocType '{0}' does not exist locally".format(doctype),
+					"severity": "blocking",
 				}
 			)
 			continue
 		for field, spec in sender_fields.items():
 			spec = spec or {}
+			s_ft = spec.get("fieldtype") or ""
+			s_reqd = int(bool(spec.get("reqd")))
 			local = local_fields.get(field)
 			if local is None:
-				diffs.append(
-					{
-						"doctype": doctype,
-						"field": field,
-						"issue": "missing_field",
-						"detail": "Field '{0}.{1}' does not exist locally".format(doctype, field),
-					}
-				)
+				if s_ft in LAYOUT_TYPES:
+					warnings.append(
+						{
+							"doctype": doctype,
+							"field": field,
+							"issue": "missing_field",
+							"detail": "Field '{0}.{1}' ({2}) does not exist locally (layout-only, safe to skip)".format(
+								doctype, field, s_ft
+							),
+							"severity": "warning",
+						}
+					)
+				elif s_ft in TABLE_TYPES:
+					blocking.append(
+						{
+							"doctype": doctype,
+							"field": field,
+							"issue": "missing_field",
+							"detail": "Field '{0}.{1}' ({2}) does not exist locally (child table, data would be lost)".format(
+								doctype, field, s_ft
+							),
+							"severity": "blocking",
+						}
+					)
+				elif s_reqd == 1:
+					blocking.append(
+						{
+							"doctype": doctype,
+							"field": field,
+							"issue": "missing_field",
+							"detail": "Field '{0}.{1}' ({2}) is required on sender but does not exist locally".format(
+								doctype, field, s_ft
+							),
+							"severity": "blocking",
+						}
+					)
+				else:
+					warnings.append(
+						{
+							"doctype": doctype,
+							"field": field,
+							"issue": "missing_field",
+							"detail": "Field '{0}.{1}' ({2}) does not exist locally (optional on sender)".format(
+								doctype, field, s_ft
+							),
+							"severity": "warning",
+						}
+					)
 				continue
-			if (spec.get("fieldtype") or "") != (local.get("fieldtype") or ""):
-				diffs.append(
-					{
-						"doctype": doctype,
-						"field": field,
-						"issue": "type_mismatch",
-						"detail": "Field '{0}.{1}' is {2} on sender, {3} locally".format(
-							doctype, field, spec.get("fieldtype"), local.get("fieldtype")
-						),
-					}
-				)
-			elif int(bool(spec.get("reqd"))) != int(bool(local.get("reqd"))):
-				diffs.append(
-					{
-						"doctype": doctype,
-						"field": field,
-						"issue": "mandatory_mismatch",
-						"detail": "Field '{0}.{1}' reqd={2} on sender, reqd={3} locally".format(
-							doctype, field, int(bool(spec.get("reqd"))), int(bool(local.get("reqd")))
-						),
-					}
-				)
-	return {"match": len(diffs) == 0, "diffs": diffs}
+			l_ft = local.get("fieldtype") or ""
+			l_reqd = int(bool(local.get("reqd")))
+			if s_ft != l_ft:
+				if s_ft in TEXT_GROUP and l_ft in TEXT_GROUP:
+					warnings.append(
+						{
+							"doctype": doctype,
+							"field": field,
+							"issue": "type_mismatch",
+							"detail": "Field '{0}.{1}' is {2} on sender, {3} locally (compatible text types, values still storable)".format(
+								doctype, field, s_ft, l_ft
+							),
+							"severity": "warning",
+						}
+					)
+				else:
+					blocking.append(
+						{
+							"doctype": doctype,
+							"field": field,
+							"issue": "type_mismatch",
+							"detail": "Field '{0}.{1}' is {2} on sender, {3} locally".format(
+								doctype, field, s_ft, l_ft
+							),
+							"severity": "blocking",
+						}
+					)
+				continue
+			# Same fieldtype: Select options drift is a warning, never blocking.
+			if s_ft == "Select":
+				if _norm_options(spec.get("options")) != _norm_options(local.get("options")):
+					warnings.append(
+						{
+							"doctype": doctype,
+							"field": field,
+							"issue": "options_mismatch",
+							"detail": "Field '{0}.{1}' Select options differ (sender={2} local={3})".format(
+								doctype, field, _norm_options(spec.get("options")), _norm_options(local.get("options"))
+							),
+							"severity": "warning",
+						}
+					)
+					continue
+			if s_reqd != l_reqd:
+				if s_reqd == 1 and l_reqd == 0:
+					warnings.append(
+						{
+							"doctype": doctype,
+							"field": field,
+							"issue": "mandatory_mismatch",
+							"detail": "Field '{0}.{1}' reqd={2} on sender, reqd={3} locally (local is more permissive)".format(
+								doctype, field, s_reqd, l_reqd
+							),
+							"severity": "warning",
+						}
+					)
+				else:
+					blocking.append(
+						{
+							"doctype": doctype,
+							"field": field,
+							"issue": "mandatory_mismatch",
+							"detail": "Field '{0}.{1}' reqd={2} on sender, reqd={3} locally (local requires a value the sender may not send)".format(
+								doctype, field, s_reqd, l_reqd
+							),
+							"severity": "blocking",
+						}
+					)
+	return {"match": len(blocking) == 0, "blocking": blocking, "warnings": warnings, "diffs": blocking + warnings}
 
 
 def verify_manifest(manifest):

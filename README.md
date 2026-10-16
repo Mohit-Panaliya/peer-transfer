@@ -111,6 +111,43 @@ sweeper + `unless-stopped`.
 - `peer_transfer.api.transfer.reject_transfer(code_or_name)`
 - `peer_transfer.api.transfer.transfer_status(code_or_name)`
 
+## Schema model (how validation really works)
+
+A Frappe schema is **three layers merged at runtime**: base DocType JSON, then
+**Custom Fields**, then **Property Setters**. The GST fields (`Customer`/
+`Address`: `gst_category`, `gstin`, `pan`, `gst_state`, …) are Custom Fields
+created by **India Compliance setup code** on install — a site without that app
+can never have them, and `Address.state` is `Autocomplete` there only via a
+Property Setter (stock Frappe: `Data`).
+
+The compare therefore reports three severities, and the UI gates on them:
+
+- **App gaps (blocking, with fix):** sender apps missing locally, e.g.
+  `Install app 'india_compliance' … then reconnect.` Always fix the gap first.
+- **Blocking:** missing mandatory fields, missing child tables, cross-group type
+  mismatches, or any warned field the offer's rows actually carry values for
+  (row-value escalation at accept — warnings become blocking when data would be
+  silently dropped).
+- **Warnings (safe to accept):** layout-only fields (Section Break, Column Break,
+  …), compatible text-type differences (`Data` vs `Autocomplete`), Select option
+  drift. Never escalate, never lose data.
+
+## Troubleshooting (second-machine installs)
+
+- `DuplicateEntryError: Module Def 'Peer Transfer'` on `install-app` → a prior
+  attempt died halfway; re-run with
+  `bench --site <site> install-app peer_transfer --force`, then `migrate`.
+- Site-wide 500 `No module named 'peer_transfer.hooks'` after install → the
+  package isn't in the bench env and/or old workers predate it:
+  `./env/bin/pip install --no-deps -e apps/peer_transfer`, then restart all
+  bench processes (`bench start` supervises them; a restart is mandatory after
+  every new-app install).
+- Fresh site shows GST `missing_field` diffs → install India Compliance
+  (`bench get-app … india_compliance`, `install-app`, `migrate`), then reconnect.
+- Page route: `/app/peer-transfer-page` (the `/app/peer-transfer` route belongs
+  to the DocType list). Viewing user needs System Manager **plus** a master-read
+  role or the Send search returns 403.
+
 ## Verified state
 
 - Relay: lifecycle/TLL/upsert/paging/errors/concurrency/restart-persistence all

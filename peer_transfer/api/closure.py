@@ -8,7 +8,8 @@ Closure = roots + everything needed to re-create them elsewhere:
 
 Row = {"doctype": ..., "name": ..., "data": {...}, "hash": sha256(canonical json)}
 Manifest = {protocol, offer_id, root_doctype, roots, schema_hash,
-            schema_snapshot, counts, row_total}
+            schema_snapshot, sender_apps, counts, row_total}
+sender_apps = [{app, version}] for every installed app (version guarded).
 
 Serialisation is ``doc.as_dict()`` minus system fields (owner/creation/
 modified/modified_by/lft/rgt, ``__``-prefixed keys), applied recursively so
@@ -148,6 +149,29 @@ def _depth(doctype, name, parent_field):
 	return depth
 
 
+def _sender_apps():
+	"""Installed apps with versions, guarded (never breaks closure build)."""
+	try:
+		apps = frappe.get_installed_apps() or []
+	except Exception:
+		return []
+	out = []
+	for app in apps:
+		try:
+			ver = frappe.get_attr("{0}.__version__".format(app))
+		except Exception:
+			ver = ""
+		try:
+			version = "" if ver is None else str(ver)
+		except Exception:
+			version = ""
+		try:
+			out.append({"app": app, "version": version})
+		except Exception:
+			continue
+	return out
+
+
 def build_closure(root_doctype="Customer", root_names=None):
 	"""Build rows + manifest for the given roots.
 
@@ -233,6 +257,7 @@ def build_closure(root_doctype="Customer", root_names=None):
 		"roots": sorted(roots),
 		"schema_hash": _schema_hash(snap),
 		"schema_snapshot": snap,
+		"sender_apps": _sender_apps(),
 		"counts": counts,
 		"row_total": len(rows),
 	}
